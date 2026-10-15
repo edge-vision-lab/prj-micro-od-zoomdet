@@ -1,0 +1,44 @@
+services:
+  mmdet-env:
+    # イメージ名
+    image: mmdetection_trial
+    
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # build時の --build-arg をここで定義
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:23.12-py3
+        USERNAME: ${USERNAME}
+        GROUPNAME: ${GROUPNAME}
+        UID: ${UID}
+        GID: ${GID}
+        PASSWORD: ${PASSWORD}
+        
+    # --net host に相当
+    network_mode: "host"
+    
+    # -e DISPLAY=$DISPLAY に相当
+    environment:
+      - DISPLAY=${DISPLAY}
+      
+    # -v オプションに相当
+    volumes:
+      - /home/${USER}/.Xauthority:/home/${USER}/.Xauthority
+      - ..:/home/${USER}/workspace
+      
+    # --gpus all に相当
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+              
+    # -it に相当
+    stdin_open: true # -i
+    tty: true        # -t
+    
+    # コンテナ実行時に実行するコマンド
+    command: /bin/bash /home/${USER}/workspace/my_docker/init_mmdet.sh
