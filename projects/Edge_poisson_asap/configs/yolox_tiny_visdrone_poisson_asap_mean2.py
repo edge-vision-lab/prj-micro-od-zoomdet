@@ -15,3 +15,7 @@ val_dataloader = dict(dataset=dict(
     ann_file=new_root + 'val/annotations.json',
     data_prefix=dict(img=new_root + 'val/images/')))
 test_dataloader = val_dataloader   # テストも検証と同じデータ
+
+# 評価で検出結果を元の座標に戻すときのメッシュも、mean2 のデータのものに差し替える
+val_evaluator = dict(mesh_dir=new_root + 'val/meshes')
+test_evaluator = val_evaluator   # テストも検証と同じ設定
