@@ -286,7 +286,7 @@ def clear_solver_cache():
     _SOLVER_CACHE.clear()
 
 
-def deform_mesh(grid_shape, node_types, scale_expand=1.5, scale_shrink=0.5, w_target=1.0, w_asap=1.0):
+def deform_mesh(grid_shape, node_types, scale_expand=2.0, scale_shrink=0.5, w_target=1.0, w_asap=1.0):
     """
     四角形メッシュの領域ベース拡大・縮小変形（元コードと同じ名前・引数・戻り値）
     grid_shape: (N, M) 縦横のノード数

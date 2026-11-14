@@ -86,7 +86,7 @@ class OriginalCoordsCocoMetric(CocoMetric):
             boxes = result["bboxes"]                     # [x1, y1, x2, y2]（変形後の座標）
             if len(boxes):
                 xywh = np.concatenate([boxes[:, :2], boxes[:, 2:] - boxes[:, :2]], axis=1)
-                xywh = inverse_bbox(xywh, map_x, map_y)  # 左上・右下を元画像の座標へ
+                xywh = inverse_bbox(xywh, map_x, map_y)  # boxを元画像の座標へ
                 new = np.concatenate([xywh[:, :2], xywh[:, :2] + xywh[:, 2:]], axis=1)
                 if self.clip:
                     new[:, [0, 2]] = np.clip(new[:, [0, 2]], 0, in_w)

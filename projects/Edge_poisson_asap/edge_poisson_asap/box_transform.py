@@ -9,7 +9,7 @@
   - draw_gt / save_gt_check : 確認用。元画像と非一様縮小後の画像に正解ボックスを描いて保存する
 
 ボックスの作り方（mode）
-  - "corner2": 左上・右下の2点だけを変換する（従来の方式。既定）
+  - "corner2": 左上・右下の2点だけを変換する（従来の方式。）
   - "mean"   : 4本の辺それぞれに n_per_side 個の点を等間隔に置いて変換し、
                左辺は x の平均、右辺は x の平均、上辺は y の平均、下辺は y の平均を、その辺の位置とする。
                  n_per_side = 2 -> 四隅の4点（左辺の x = 左上と左下の x の平均）
@@ -49,6 +49,9 @@ import numpy as np
 # 使えるボックスの作り方
 BOX_MODES = ("corner2", "mean", "minmax")
 
+# box_transform.py の先頭付近。正解の作成と逆変換で必ず同じ方式を使うため、1か所で決める
+DEFAULT_MODE = "mean"      # ボックスの作り方
+DEFAULT_N_PER_SIDE = 3     # 1本の辺に置く点の数
 
 def _bilinear(grid, u, v):
     """
@@ -195,15 +198,15 @@ def _transform_bbox(bboxes, point_fn, mode, n_per_side):
     return _aggregate_sides(q, mode)
 
 
-def forward_bbox(bboxes, fmap, mode="mean", n_per_side=2):
+def forward_bbox(bboxes, fmap, mode=DEFAULT_MODE, n_per_side=DEFAULT_N_PER_SIDE):
     """
     COCO ボックス (K, 4) を元画像 -> 変形後へ。
-    mode, n_per_side はモジュール先頭の「ボックスの作り方」を参照（既定は従来の2点）
+    mode, n_per_side はモジュール先頭の「ボックスの作り方」を参照
     """
     return _transform_bbox(bboxes, lambda p: forward_points(p, fmap), mode, n_per_side)
 
 
-def inverse_bbox(bboxes, map_x, map_y, mode="corner2", n_per_side=3):
+def inverse_bbox(bboxes, map_x, map_y, mode=DEFAULT_MODE, n_per_side=DEFAULT_N_PER_SIDE):
     """
     COCO ボックス (K, 4) を変形後 -> 元画像へ。
     mode, n_per_side は forward_bbox と同じものを使う（正解と検出で作り方をそろえるため）
