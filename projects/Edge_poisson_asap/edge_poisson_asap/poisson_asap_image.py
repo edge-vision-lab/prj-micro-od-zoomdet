@@ -8,12 +8,19 @@
   - edge_nonuniform_resize : 画像だけを渡すと、make_expand_region.get_expand_region で
                         マップを作ってから nonuniform_resize を行う（実際に使う入口）
 
+nonuniform_resize(..., name=名前, show_img=True) とすると、メッシュの可視化を
+poisson_asap_warp.DEBUG_DIR（debug_mesh/）に {名前}_mesh.png として保存する。
+
 32 の倍数へのパディングはここでは行わない（検出器に入れる直前に mmdet 側で行う）。
 
-動作確認（projects/Edge_poisson_asap/ で実行）:
-    python -m edge_poisson_asap.poisson_asap_image --image 画像 [画像 ...]
+動作確認 / make_deformed_dataset.py のデバッグ用（projects/Edge_poisson_asap/ で実行）:
+    python -m edge_poisson_asap.poisson_asap_image --image 画像 [画像 ...] \
+        [--scale-expand 2.0 --scale-shrink 0.5 --w-target 1.0 --w-asap 1.0 --thresh 0.5]
   --image には画像ファイルかフォルダを1つ以上指定する（フォルダなら中の画像を名前順に --limit 枚）。
+  変形の強さ（--scale-expand など）は make_deformed_dataset.py と同じ引数・同じ既定値にしてあるので、
+  データセットを作る前に、使う設定での変形・メッシュ・裏返りを数枚で下見するのに使える。
   結果の画像はこのファイルと同じ場所の deform_images/ に保存する（--out-dir で変更可）。
+  メッシュの可視化は同じ場所の debug_mesh/ に保存する（poisson_asap_warp.DEBUG_DIR）。
 """
 import argparse
 import os
@@ -24,7 +31,7 @@ import numpy as np
 
 # 同じパッケージ内のファイルを相対 import する
 from .make_expand_region import get_expand_region      # 利用者のマップ作成（元画像 -> 0/1）
-from .poisson_asap_warp import build_forward_map, compute_content_size
+from .poisson_asap_warp import build_forward_map, compute_content_size, save_fold_overlay
 from .poisson_asap_remap import build_inverse_map
 
 
@@ -59,11 +66,14 @@ def resize_uniform(img, box_size=(800, 800), interpolation=cv2.INTER_LINEAR):
 
 def nonuniform_resize(img, region_map, box_size=(800, 800), thresh=0.5,
                       scale_expand=2.0, scale_shrink=0.5, w_target=1.0, w_asap=1.0,
-                      inverse_method="fast", interpolation=cv2.INTER_LINEAR):
+                      inverse_method="fast", interpolation=cv2.INTER_LINEAR,
+                      name=None, show_img=False):
     """
     1枚の画像を非一様縮小する（手順2〜7をまとめて実行）。
     img       : 元画像 (H, W) または (H, W, C)
     region_map: get_expand_region(img) の出力。img と同じ (H, W) の 0/1 マップ
+    name      : 可視化画像のファイル名に使う名前（show_img=True のとき）
+    show_img  : True のとき、メッシュの可視化を debug_mesh/{name}_mesh.png に保存する
     Returns:
       warped : 非一様縮小した画像（内容サイズ）
       fmap   : ForwardMap（順写像。正解ボックスの変換に使う）
@@ -72,8 +82,9 @@ def nonuniform_resize(img, region_map, box_size=(800, 800), thresh=0.5,
     if region_map.shape[:2] != img.shape[:2]:
         raise ValueError(f"マップの大きさ {region_map.shape[:2]} が画像 {img.shape[:2]} と違います")
     # 手順2〜5: 順写像（各ノードの元画像上の位置 src と、変形後の位置 dst）
+    #   show_img=True ならメッシュ作成側（poisson_asap_warp）で可視化を保存する
     fmap = build_forward_map(region_map, box_size, thresh, scale_expand, scale_shrink,
-                             w_target, w_asap)
+                             w_target, w_asap, name=name, show_img=show_img)
     # 手順6: 逆写像（出力の各画素が読む元画像の座標）
     map_x, map_y = build_inverse_map(fmap, method=inverse_method)
     # 手順7: 元画像から読み取って非一様縮小
@@ -96,7 +107,7 @@ def edge_nonuniform_resize(img, box_size=(800, 800), **kwargs):
 
 
 # ===========================================================================
-# 動作確認
+# 動作確認 / make_deformed_dataset.py のデバッグ
 # ===========================================================================
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
@@ -141,19 +152,47 @@ def save_comparison(path, img, region_map, uniform, warped):
     plt.close(fig)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="非一様縮小（remap）の動作確認")
+def parse_args():
+    """
+    コマンドライン引数を読む（main が長くならないよう分けた）。
+    変形の強さ（--scale-expand など）は make_deformed_dataset.py と同じ名前・同じ既定値にして、
+    データセット作成前に同じ設定で下見できるようにしている。
+    """
+    parser = argparse.ArgumentParser(description="非一様縮小（remap）の動作確認 / データセット作成のデバッグ")
     parser.add_argument("--image", nargs="+", required=True,
                         help="元画像のファイルまたはフォルダ（複数可）")
     parser.add_argument("--limit", type=int, default=3, help="フォルダから取り出す枚数（既定 3）")
     parser.add_argument("--box", type=int, nargs=2, default=[800, 800], metavar=("W", "H"),
                         help="縮小の枠（幅 高さ）。既定 800 800")
+    # --- 変形の強さ（make_deformed_dataset.py と同じ引数・既定値）---
+    parser.add_argument("--thresh", type=float, default=0.5,
+                        help="マップ縮小時の閾値。面積平均した拡大領域の割合がこれ以上なら拡大")
+    parser.add_argument("--scale-expand", type=float, default=2.0,
+                        help="拡大領域のセルを何倍にするかの目標倍率（既定 2.0）")
+    parser.add_argument("--scale-shrink", type=float, default=0.5,
+                        help="縮小領域のセルを何倍にするかの目標倍率（既定 0.5）")
+    parser.add_argument("--w-target", type=float, default=1.0,
+                        help="目標倍率を優先する強さ（大きいほど倍率どおりに変形）")
+    parser.add_argument("--w-asap", type=float, default=1.0,
+                        help="形のゆがみを抑える強さ（大きいほど裏返りにくいが倍率は甘くなる）")
     parser.add_argument("--out-dir",
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "deform_images"),
                         help="結果の保存先。既定はこのファイルと同じ場所の deform_images/")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     box_size = tuple(args.box)
     os.makedirs(args.out_dir, exist_ok=True)
+    # nonuniform_resize に渡す変形の設定を1つにまとめる（無変形チェック以外は常にこれを使う）
+    warp_kwargs = dict(thresh=args.thresh, scale_expand=args.scale_expand,
+                       scale_shrink=args.scale_shrink, w_target=args.w_target,
+                       w_asap=args.w_asap)
+    # どの設定で動かしているかを最初に出す（デバッグ用。make_deformed_dataset.py と見比べやすく）
+    print(f"変形の設定: box={box_size}, thresh={args.thresh}, "
+          f"scale_expand={args.scale_expand}, scale_shrink={args.scale_shrink}, "
+          f"w_target={args.w_target}, w_asap={args.w_asap}")
 
     files = collect_images(args.image, args.limit)
     if not files:
@@ -170,14 +209,22 @@ def main():
         t0 = time.perf_counter()
         region_map = get_expand_region(img,name,show_img=True)
         t1 = time.perf_counter()
-        warped, fmap, _ = nonuniform_resize(img, region_map, box_size)
+        # show_img=True: メッシュの可視化を debug_mesh/{name}_mesh.png に保存（時間に含まれる）
+        # warp_kwargs: コマンドラインで指定した変形の強さ（--scale-expand など）
+        warped, fmap, _ = nonuniform_resize(img, region_map, box_size,
+                                            name=name, show_img=True, **warp_kwargs)
         t2 = time.perf_counter()
         uniform = resize_uniform(img, box_size)
+        # 裏返りの領域を変形後画像に重ねた画像も保存する（debug_mesh/{name}_fold_overlay.png）
+        #   メッシュ上の可視化（_mesh.png, _fold.png）は build_forward_map 側で保存済み
+        save_fold_overlay(warped, fmap, name)
         print(f"[{name}] 元画像 {img.shape[1]}x{img.shape[0]} -> {warped.shape[1]}x{warped.shape[0]}, "
               f"拡大領域 {region_map.mean() * 100:.1f}%, 裏返り={fmap.n_fold}, "
               f"マップ作成 {t1 - t0:.2f}s, 非一様縮小 {t2 - t1:.2f}s（サイズの初回は分解を含む）")
 
         # --- 1枚目だけ: 変形しない設定の remap が一様縮小（cv2.resize）と一致するか ---
+        #   これは remap 処理そのものの正しさを確かめる検証なので、指定した倍率とは無関係に
+        #   scale_expand=scale_shrink=1.0（無変形）で固定する
         if n == 0:
             same, _, _ = nonuniform_resize(img, region_map, box_size,
                                            scale_expand=1.0, scale_shrink=1.0)

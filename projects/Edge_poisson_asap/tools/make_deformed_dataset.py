@@ -5,11 +5,14 @@
   1. 元画像を読み、get_expand_region でマップを作る（make_expand_region.py）
   2. nonuniform_resize で非一様縮小した画像（内容サイズ）を作り、PNG で保存する
      （JPEG で保存し直すと圧縮の劣化が加わり、一様縮小と条件がずれるので可逆の PNG にする）
-  3. 正解ボックスを順写像で変形後の座標に変換する（左上と右下の2点を変換）
+  3. 正解ボックスを順写像で変形後の座標に変換する
+     （ボックスの作り方は --bbox-mode, --bbox-n-per-side。box_transform.py の「ボックスの作り方」を参照）
   4. --save-mesh を付けたときは、変形後のノード位置 dst と逆写像 map_x, map_y を保存する
      （評価で検出結果を元画像の座標に戻すときに使う。val だけでよい。
       逆写像も保存しておくと評価のたびに計算しなくて済む。val 548 枚で 1〜2GB 程度の見込み）
 最後に、元の json と同じ形式で、画像の大きさとボックスを書き換えた json を保存する。
+作成時の設定（ボックスの作り方 bbox_mode, bbox_n_per_side を含む）は settings.json に残す。
+評価・描画のツールは、既定でこの settings.json の方式で検出を元の座標へ戻す。
 
 置き場所: projects/Edge_poisson_asap/tools/make_deformed_dataset.py
 使い方（projects/Edge_poisson_asap/ で実行）:
@@ -17,12 +20,14 @@
       --ann ../../data_ann/VisDrone/my_val.json \
       --img-dir ../../data/VisDrone/VisDrone2019-DET-val/images \
       --out-dir ../../data_ann/VisDrone_poisson_asap/val \
+      --bbox-mode mean --bbox-n-per-side 3 \
       --save-mesh
   出力:
     {out-dir}/images/{元の名前}.png    非一様縮小した画像
     {out-dir}/annotations.json         変形後の座標の正解
     {out-dir}/meshes/{元の名前}.npz     変形後のノード位置と逆写像（--save-mesh のとき）
     {out-dir}/settings.json            作成時の設定（あとで条件を確認するため）
+  注意: --box は出力の大きさ（W H）、--bbox-* はボックスの作り方で、別のもの
 """
 import argparse
 import json
@@ -41,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from edge_poisson_asap.make_expand_region import get_expand_region   # noqa: E402
 from edge_poisson_asap.poisson_asap_image import nonuniform_resize    # noqa: E402
 from edge_poisson_asap.box_transform import forward_bbox               # noqa: E402
+from edge_poisson_asap.box_method import add_box_args                  # noqa: E402
 
 # 各ワーカー（並列処理のプロセス）が共有する設定。initializer で一度だけ入れる
 _CFG = None
@@ -58,7 +64,7 @@ def process_one(job):
     """
     img_info, anns = job
     cfg = _CFG
-    stem = os.path.splitext(img_info["file_name"])[0]
+    stem = os.path.splitext(img_info["file_name"])[0]   # 拡張子を除いた元画像の名前
     img = cv2.imread(os.path.join(cfg["img_dir"], img_info["file_name"]))   # BGR, uint8
     if img is None:
         raise FileNotFoundError(f"画像を読めません: {img_info['file_name']}")
@@ -72,10 +78,11 @@ def process_one(job):
         w_target=cfg["w_target"], w_asap=cfg["w_asap"])
     cv2.imwrite(os.path.join(cfg["out_dir"], "images", stem + ".png"), warped)
 
-    # 3. 正解ボックスを変形後の座標へ
+    # 3. 正解ボックスを変形後の座標へ（作り方は引数で指定したもの。settings.json にも残る）
     new_anns = []
     if anns:
-        new_boxes = forward_bbox([a["bbox"] for a in anns], fmap)
+        new_boxes = forward_bbox([a["bbox"] for a in anns], fmap,
+                                 cfg["bbox_mode"], cfg["bbox_n_per_side"])
         for a, b in zip(anns, new_boxes):
             na = dict(a)                                   # 他の項目（ignore など）はそのまま
             na["bbox"] = [round(float(v), 2) for v in b]
@@ -99,22 +106,31 @@ def process_one(job):
     return new_info, new_anns, log
 
 
-def main():
+def parse_args():
+    """コマンドライン引数を読む（main が長くならないよう分けた）"""
     parser = argparse.ArgumentParser(description="非一様縮小したデータセットを事前に作る")
     parser.add_argument("--ann", required=True, help="元の COCO 形式の json")
     parser.add_argument("--img-dir", required=True, help="元画像のフォルダ")
     parser.add_argument("--out-dir", required=True, help="保存先（元データとは別の書き込める場所）")
-    parser.add_argument("--box", type=int, nargs=2, default=[800, 800], metavar=("W", "H"))
+    parser.add_argument("--box", type=int, nargs=2, default=[800, 800], metavar=("W", "H"),
+                        help="出力の大きさ（ボックスの作り方ではない）")
     parser.add_argument("--thresh", type=float, default=0.5)
     parser.add_argument("--scale-expand", type=float, default=2.0)
     parser.add_argument("--scale-shrink", type=float, default=0.5)
     parser.add_argument("--w-target", type=float, default=1.0)
     parser.add_argument("--w-asap", type=float, default=1.0)
+    # 正解ボックスの作り方（--bbox-mode, --bbox-n-per-side）。正解を作る側なので既定値を持たせる
+    add_box_args(parser, from_settings=False)
     parser.add_argument("--save-mesh", action="store_true", help="評価用にノード位置を保存（val 用）")
     parser.add_argument("--workers", type=int, default=1,
                         help="並列プロセス数。1プロセスあたり分解に約4〜8GBのメモリを使う")
     parser.add_argument("--limit", type=int, default=None, help="試しに先頭の何枚だけ処理する")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    print(f"正解ボックスの作り方: mode={args.bbox_mode}, n_per_side={args.bbox_n_per_side}")
 
     os.makedirs(os.path.join(args.out_dir, "images"), exist_ok=True)
     if args.save_mesh:
@@ -122,7 +138,7 @@ def main():
 
     with open(args.ann) as f:
         coco = json.load(f)
-    anns_by_img = defaultdict(list)
+    anns_by_img = defaultdict(list)                # 画像 id -> その画像の正解
     for a in coco["annotations"]:
         anns_by_img[a["image_id"]].append(a)
     images = coco["images"][:args.limit] if args.limit else coco["images"]
@@ -133,7 +149,8 @@ def main():
     cfg = {"img_dir": args.img_dir, "out_dir": args.out_dir, "box": args.box,
            "thresh": args.thresh, "scale_expand": args.scale_expand,
            "scale_shrink": args.scale_shrink, "w_target": args.w_target,
-           "w_asap": args.w_asap, "save_mesh": args.save_mesh}
+           "w_asap": args.w_asap, "save_mesh": args.save_mesh,
+           "bbox_mode": args.bbox_mode, "bbox_n_per_side": args.bbox_n_per_side}
 
     new_images, new_anns, logs = [], [], []
     t0 = time.perf_counter()
@@ -151,10 +168,11 @@ def main():
     out["annotations"] = sorted(new_anns, key=lambda a: a["id"])
     with open(os.path.join(args.out_dir, "annotations.json"), "w") as f:
         json.dump(out, f)
+    # 引数をすべて残す（bbox_mode, bbox_n_per_side も入る。評価・描画のツールがこれを読む）
     with open(os.path.join(args.out_dir, "settings.json"), "w") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-    region = np.array([lg["region"] for lg in logs])
+    region = np.array([lg["region"] for lg in logs])   # 画像ごとの拡大領域の割合
     print(f"完了: {len(new_images)} 枚, ボックス {len(new_anns)} 個")
     print(f"  拡大領域の割合: 平均 {region.mean() * 100:.1f}%（最小 {region.min() * 100:.1f}%, "
           f"最大 {region.max() * 100:.1f}%）")

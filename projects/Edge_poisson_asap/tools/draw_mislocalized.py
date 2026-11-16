@@ -5,6 +5,8 @@
   2. 検出を、保存済みの逆写像（{warp-dir}/meshes/*.npz の map_x, map_y）で元の座標へ戻す
   3. mislocalized_cases.collect_cases で「クラスは正しいが元の座標での IoU が低い」検出を集める
   4. 1件ごとに4枚のパネルを作り、横に並べた図と一緒に保存する
+  2 で元の座標へ戻すときのボックスの作り方は --bbox-mode, --bbox-n-per-side で指定する
+  （省略すると --warp-dir の settings.json に残っている、正解を作ったときの方式）
 
 1件につき4枚（ボックスは1枚に1つだけ描く。左から順に横に並べる）:
   1. 元画像の正解（緑）
@@ -34,6 +36,7 @@
       --config configs/yolox_tiny_visdrone_poisson_asap.py \
       --checkpoint ../../work_dirs/yolox_tiny_visdrone_poisson_asap_e50/epoch_50.pth \
       --out-dir ../../work_dirs/eval_visdrone_poisson_asap_e50/mislocalized --score-thr 0.3
+  方式を変えて比べる例: 上に --bbox-mode minmax --bbox-n-per-side all を付ける
 """
 import argparse
 import csv
@@ -43,8 +46,8 @@ import cv2
 import numpy as np
 from mmdet.apis import inference_detector, init_detector
 
-from edge_poisson_asap.box_transform import (DEFAULT_MODE, DEFAULT_N_PER_SIDE, inverse_bbox,
-                                             select_targets)
+from edge_poisson_asap.box_method import add_box_args, resolve_box_method
+from edge_poisson_asap.box_transform import inverse_bbox, select_targets
 from mislocalized_cases import collect_cases, load_json
 
 GT_COLOR = (0, 255, 0)    # 正解の枠の色（BGR で緑）
@@ -87,8 +90,9 @@ def to_det_dicts(image_id, boxes, scores, cats):
             for b, s, c in zip(boxes, scores, cats)]
 
 
-def run_detection(model, targets, warped_images, warp_dir, score_thr, label_to_cat):
+def run_detection(model, targets, warped_images, warp_dir, score_thr, label_to_cat, box_mode, n_per_side):
     """対象の画像ごとに、変形後の画像で推論し、逆写像で元の座標へ戻す。
+    box_mode, n_per_side: 元の座標へ戻すときのボックスの作り方（resolve_box_method で決めたもの）
     Returns: (元の座標の検出, 変形後の座標の検出)  どちらも results.bbox.json と同じ形で、同じ並び
     （同じ並びにしておくと、collect_cases の中で2つが1対1に対応付けられる）"""
     det_orig, det_def = [], []
@@ -101,8 +105,8 @@ def run_detection(model, targets, warped_images, warp_dir, score_thr, label_to_c
         img_d = read_image(os.path.join(warp_dir, "images", w["file_name"]))
         boxes, scores, cats = detect(model, img_d, score_thr, label_to_cat)
         det_def += to_det_dicts(w["id"], boxes, scores, cats)
-        # 逆変換の方式は box_transform.py の既定値（DEFAULT_MODE, DEFAULT_N_PER_SIDE）
-        det_orig += to_det_dicts(o["id"], inverse_bbox(boxes, *maps), scores, cats)
+        # 逆変換の方式は引数（省略時は settings.json）で決めたもの
+        det_orig += to_det_dicts(o["id"], inverse_bbox(boxes, *maps, box_mode, n_per_side), scores, cats)
         if n % 50 == 0 or n == len(targets):
             print(f"推論 {n}/{len(targets)} 枚")
     return det_orig, det_def
@@ -277,13 +281,15 @@ def write_csv(selected, path):
             writer.writerow({k: c[k] for k in fields})
 
 
-def print_settings(warp_dir):
-    """変形後のデータの作成時の設定（settings.json）と、逆変換の方式を表示する"""
+def print_settings(warp_dir, box_mode=None, n_per_side=None):
+    """変形後のデータの作成時の設定（settings.json）を表示し、逆変換の方式を決めて返す。
+    box_mode, n_per_side: 引数で指定された方式（None なら settings.json の値を使う）
+    Returns: (box_mode, n_per_side)  実際に使う方式"""
     path = os.path.join(warp_dir, "settings.json")
     if os.path.isfile(path):
         print(f"変形後のデータの作成時の設定: {load_json(path)}")
-    print(f"検出を元の座標へ戻す方式: mode={DEFAULT_MODE}, n_per_side={DEFAULT_N_PER_SIDE}"
-          "（box_transform.py の既定値）")
+    # 指定 > settings.json > 既定値 の順で決め、正解を作ったときと違えば警告する
+    return resolve_box_method(warp_dir, box_mode, n_per_side)
 
 
 # ===========================================================================
@@ -311,12 +317,14 @@ def parse_args():
     p.add_argument("--sort", choices=["score", "iou"], default="score", help="描く順（番号の付け方）")
     p.add_argument("--max-cases", type=int, default=100, help="保存する候補の数")
     p.add_argument("--panel-size", type=int, default=320, help="1パネルの一辺 [px]")
+    # 検出を元の座標へ戻すときのボックスの作り方。省略すると --warp-dir の settings.json の値
+    add_box_args(p, from_settings=True)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    print_settings(args.warp_dir)
+    box_mode, n_per_side = print_settings(args.warp_dir, args.bbox_mode, args.bbox_n_per_side)
     gt_o = load_json(args.orig_ann)
     gt_d = load_json(os.path.join(args.warp_dir, "annotations.json"))   # 変形後の正解
     warped_images = {im["id"]: im for im in gt_d["images"]}   # make_deformed_dataset.py は画像 id を変えない
@@ -329,7 +337,7 @@ def main():
     name_to_cat = {c["name"]: c["id"] for c in gt_o["categories"]}
     label_to_cat = [name_to_cat[n] for n in model.dataset_meta["classes"]]
     det_orig, det_def = run_detection(model, targets, warped_images, args.warp_dir,
-                                      args.score_thr, label_to_cat)
+                                      args.score_thr, label_to_cat, box_mode, n_per_side)
 
     # クラスは正しいが元の座標での IoU が低い検出を集める
     cases, n_fallback = collect_cases(gt_o, gt_d, det_orig, det_def,

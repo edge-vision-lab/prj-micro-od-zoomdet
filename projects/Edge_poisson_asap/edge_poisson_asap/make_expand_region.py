@@ -11,7 +11,7 @@ import cv2
 import os
 
 # 確認用画像の保存先（make_expand_region.py と同じ場所の region_debug/ フォルダ）
-DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "region_debug")
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_region")
 
 
 def to_uint8(im):

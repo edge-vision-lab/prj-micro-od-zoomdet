@@ -3,6 +3,8 @@
 box_transform.py の main（正解を描く確認）に、検出結果の描画を足したもの。
 変形後の画像・変形後の正解・逆写像は、make_deformed_dataset.py で作成済みのもの（--warp-dir）を読む。
 逆写像（meshes/*.npz）は --save-mesh で作ったデータ（val）にしかないので、val で使う。
+検出を元の座標へ戻すときのボックスの作り方は --bbox-mode, --bbox-n-per-side で指定する
+（省略すると --warp-dir の settings.json に残っている、正解を作ったときの方式）。
 
 1枚の画像につき、次を保存する:
   {name}_orig_gt.png       元画像 + 元の正解
@@ -26,7 +28,8 @@ box_transform.py の main（正解を描く確認）に、検出結果の描画�
         --orig-img ../../data/VisDrone/VisDrone2019-DET-val/images/0000277_03401_d_0000555.jpg \
         --warp-dir ../../data_ann/VisDrone_poisson_asap/val \
         --config configs/yolox_tiny_visdrone_poisson_asap.py --checkpoint ../../work_dirs/yolox_tiny_visdrone_poisson_asap_e50/epoch_50.pth \
-        --out-dir ../../work_dirs/eval_visdrone_poisson_asap_e50/detection_images
+        --out-dir ../../work_dirs/eval_visdrone_poisson_asap_e50/detection_images \
+        --bbox-mode corner2 --bbox-n-per-side all
 """
 import argparse
 import json
@@ -37,6 +40,7 @@ import cv2
 import numpy as np
 from mmdet.apis import inference_detector, init_detector
 
+from edge_poisson_asap.box_method import add_box_args, resolve_box_method
 from edge_poisson_asap.box_transform import SINGLE_COLOR, draw_gt, inverse_bbox, select_targets
 
 DET_COLOR = (0, 255, 0)   # 検出の枠の色（BGR で緑）。正解（SINGLE_COLOR = 赤）と見分けるため
@@ -62,7 +66,7 @@ def detect(model, img, score_thr, label_to_cat):
     """非一様縮小後の画像（BGR）で推論し、score_thr 以上の検出を返す。
     Returns: ボックス (K, 4) [x, y, w, h]（変形後の座標）, カテゴリ id (K,)"""
     inst = inference_detector(model, img).pred_instances   # 配列を渡すと読み込み処理が配列用になる
-    keep = inst.scores >= score_thr
+    keep = inst.scores >= score_thr                         # スコアが下限以上の検出
     xyxy = inst.bboxes[keep].cpu().numpy()
     xywh = np.c_[xyxy[:, :2], xyxy[:, 2:] - xyxy[:, :2]]   # x1y1x2y2 -> COCO の xywh
     cats = [label_to_cat[int(l)] for l in inst.labels[keep].cpu().numpy()]
@@ -96,7 +100,7 @@ def save_check(out_dir, name, orig_img, warped_img, orig_gts, warped_gts, orig_d
     for key, (img, _) in panels.items():
         cv2.imwrite(os.path.join(out_dir, f"{name}_{key}.png"), img)
 
-    small_size = (int(round(orig_img.shape[1] * scale)), warped_img.shape[0])
+    small_size = (int(round(orig_img.shape[1] * scale)), warped_img.shape[0])   # 縮小した元画像の大きさ
 
     def cell(key):
         """一覧の1マス: 元画像は変形後の画像と同じ高さに縮小し、タイトルを付ける"""
@@ -126,6 +130,8 @@ def parse_args():
     parser.add_argument("--score-thr", type=float, default=0.3, help="描く検出のスコアの下限")
     parser.add_argument("--color-mode", choices=["single", "class"], default="single",
                         help="single: 正解は赤・検出は緑で統一（既定） / class: カテゴリごとに色を分ける")
+    # 検出を元の座標へ戻すときのボックスの作り方。省略すると --warp-dir の settings.json の値
+    add_box_args(parser, from_settings=True)
     parser.add_argument("--out-dir", default="work_dirs/det_check", help="保存先")
     return parser.parse_args()
 
@@ -141,6 +147,8 @@ def main():
     if os.path.isfile(settings_path):
         with open(settings_path) as f:
             print(f"変形後のデータの作成時の設定: {json.load(f)}")
+    # 検出を元の座標へ戻す方式を決める（指定 > settings.json > 既定値）
+    box_mode, n_per_side = resolve_box_method(args.warp_dir, args.bbox_mode, args.bbox_n_per_side)
 
     # 画像 id ごとに正解をまとめる（make_deformed_dataset.py は画像 id を変えない）
     orig_anns, warped_anns = defaultdict(list), defaultdict(list)
@@ -180,7 +188,7 @@ def main():
 
         # 検出: 変形後の画像で推論し、保存済みの逆写像で元の座標へ戻す
         det_boxes, det_cats = detect(model, warped_img, args.score_thr, label_to_cat)
-        orig_dets = to_anns(inverse_bbox(det_boxes, *maps), det_cats)
+        orig_dets = to_anns(inverse_bbox(det_boxes, *maps, box_mode, n_per_side), det_cats)
 
         # 正解（元の正解と作成済みの変形後の正解）と検出を描き、4枚と一覧を保存する
         save_check(args.out_dir, name, orig_img, warped_img,
