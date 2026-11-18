@@ -3,7 +3,7 @@
   - IoU のヒストグラム（サイズで色分け）      : {name}_{subset}_hist_iou.png
   - スコアのヒストグラム（サイズで色分け）    : {name}_{subset}_hist_score.png
   - スコア（横）× IoU（縦）の散布図         : {name}_{subset}_scatter.png
-  - 件数表（--iou-bounds と --score-bound を指定したときだけ）: {name}_count_table.csv と画面表示
+  - 件数表（画面表示と {name}_summary.csv）
 「枠は出ているが位置の精度が悪いだけか」を見るために使う。手法どうしの比較は、
 手法ごとに1回ずつ実行して図を並べて見る（軸範囲はどの図も 0〜1 で固定）。
 
@@ -14,16 +14,18 @@
 図に使うデータは --subset で選ぶ（1つでも複数でもよい。複数なら図をそれぞれ出す）:
   all   : 重複を省いた全検出（重複の省き方は以前と同じ）
   match : そのうちクラス一致の検出だけ
-件数表は表の中にクラス一致/不一致の列があるので、--subset によらず重複を省いた全検出で1つだけ出す。
+件数表は表の中にクラス正解/不正解の行があるので、--subset によらず重複を省いた全検出から作る。
+項目は「検出枠数・クラス正解/不正解・IoU 閾値での内訳・クラス正解の IoU の平均と中央値」で、
+「全検出 / score>=t（--summary-score-thrs）」×「all / small / medium / large」ごとに出す。
+相手なし（IoU = 0）の検出はサイズが決まらないので all にだけ入る。
 
 置き場所: projects/Edge_poisson_asap/tools/plot_score_iou.py
 使い方（workspace/ で実行）:
   (A) bbox.json から、全検出とクラス一致のみの両方の図と件数表を出す
      python projects/Edge_poisson_asap/tools/plot_score_iou.py \
-         --pred work_dirs/eval_visdrone_uniform/results.bbox.json \
+         --pred work_dirs/eval_visdrone_uniform_e50/results.bbox.json \
          --gt data_ann/VisDrone/my_val.json \
          --subset all match \
-         --iou-bounds 0.1 0.5 --score-bound 0.3 \
          --out-dir work_dirs/score_iou_plots/uniform
   (B) 学習重みから（図はクラス一致のみ）
      python projects/Edge_poisson_asap/tools/plot_score_iou.py \
@@ -41,12 +43,13 @@ import argparse
 import csv
 import os
 import sys
+import unicodedata
 
 # tools/ から直接実行しても同じフォルダのモジュールを読み込めるようにする
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS_DIR)
 from score_iou_figures import plot_histograms, plot_scatter  # noqa: E402
-from score_iou_match import (SIZE_GROUPS, SUBSET_ALL, SUBSETS, count_table,  # noqa: E402
+from score_iou_match import (SUBSET_ALL, SUBSETS, build_summaries,  # noqa: E402
                              load_dets, load_gt, match_all, select_subset)
 
 # 図のタイトルに付ける、データの選び方の説明
@@ -78,10 +81,11 @@ def parse_args():
     p.add_argument("--hist-scale", choices=["log", "linear"], default="log",
                    help="ヒストグラムの縦軸（既定 log）")
     # 件数表の設定
-    p.add_argument("--iou-bounds", nargs="+", type=float, default=None,
-                   help="件数表の IoU の帯の境界（例: 0.1 0.5）。省略すると件数表を出さない")
-    p.add_argument("--score-bound", type=float, default=None,
-                   help="件数表のスコア高/低の境界（例: 0.3）。--iou-bounds と一緒に指定する")
+    p.add_argument("--iou-thr", type=float, default=0.5,
+                   help="件数表で「IoU が高い/低い」を分ける閾値（既定 0.5）")
+    p.add_argument("--summary-score-thrs", nargs="*", type=float, default=[0.3],
+                   help="件数表をスコアで絞った版も出すときの閾値（複数可、既定 0.3）。"
+                        "何も書かなければ全検出の表だけ")
     args = p.parse_args()
 
     # 引数の組み合わせの確認
@@ -89,12 +93,6 @@ def parse_args():
         p.error("--checkpoint を使うときは --config も指定してください")
     if args.pred is not None and args.config is not None:
         p.error("--config は --checkpoint と一緒に使います（--pred のときは不要です）")
-    if (args.iou_bounds is None) != (args.score_bound is None):
-        p.error("--iou-bounds と --score-bound は両方指定するか、両方省略してください")
-    if args.iou_bounds is not None:
-        b = args.iou_bounds
-        if any(not 0 < v < 1 for v in b) or b != sorted(b):
-            p.error("--iou-bounds は 0 と 1 の間で小さい順に指定してください")
     # 同じ subset を2回書かれても図は1回だけ出す（順番は書かれた順のまま）
     args.subset = list(dict.fromkeys(args.subset))
     return args
@@ -139,31 +137,39 @@ def print_stats(name, st):
           f"1枚あたりの最大検出数 {st['max_per_img']}, 最小スコア {st['min_score']:.4f}")
 
 
-def write_tables(matched, name, iou_bounds, score_bound, path):
+def _fmt(v):
+    """表の値を文字にする（None は「-」、小数は3桁）"""
+    if v is None:
+        return "-"
+    return f"{v:.3f}" if isinstance(v, float) else str(v)
+
+
+def _pad(text, width):
+    """全角文字を2文字分として数え、表示幅が width になるよう右側を空白で埋める（表の列をそろえるため）"""
+    w = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+    return text + " " * max(width - w, 0)
+
+
+def write_summary(blocks, name, path):
     """
-    件数表をサイズの区切り（all / small / medium / large）ごとに作り、1つの CSV に保存して画面にも表示する
-    （以前の write_tables を1手法用にし、サイズの列を足したもの）
+    件数表を区切りごとに画面に表示し、まとめて1つの CSV に保存する
+    （以前の write_summary を1手法用にしたもの。CSV の列は score_filter, size, item, 手法名）
     """
-    with open(path, "w", newline="") as f:
+    width = max(16, len(name) + 2)     # 値の列の幅（手法名が長くても列がくっつかないように）
+    for s_name, size_name, rows in blocks:
+        print(f"\n=== 件数表: {s_name} / サイズ {size_name} ===")
+        print(_pad("項目", 44) + f"{name:>{width}}")
+        for label, value in rows:
+            print(_pad(label, 44) + f"{_fmt(value):>{width}}")
+
+    # Excel で開いても文字化けしないよう、BOM 付きの UTF-8 で保存する
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["method", "size", "score_band", "iou_band", "class", "count"])
-        for size, size_name in SIZE_GROUPS:
-            rows = count_table(matched, iou_bounds, score_bound, size)
-            for r in rows:
-                w.writerow([name, size_name, *r])
-            print_table(name, size_name, rows)
+        w.writerow(["score_filter", "size", "item", name])
+        for s_name, size_name, rows in blocks:
+            for label, value in rows:
+                w.writerow([s_name, size_name, label.strip(), _fmt(value)])
 
-
-def print_table(name, size_name, rows):
-    """件数表を「スコアの帯 × IoU の帯」の行、「クラス一致/不一致/計」の列で表示する"""
-    print(f"\n=== 件数表: {name} / サイズ {size_name} ===")
-    print(f"{'score':<12}{'IoU':<16}{'match':>10}{'mismatch':>10}{'total':>10}")
-    # rows は (スコアの帯, IoU の帯) ごとに 一致 → 不一致 の順で2行ずつ並んでいる
-    for i in range(0, len(rows), 2):
-        s_name, i_name, _, n_match = rows[i]
-        n_mis = rows[i + 1][3]
-        print(f"{s_name:<12}{i_name:<16}{n_match:>10}{n_mis:>10}{n_match + n_mis:>10}")
-        
 
 def save_figures(matched, subset, name, args):
     """1つの subset について、散布図と2つのヒストグラムを保存し、保存したファイル名の頭を返す"""
@@ -193,15 +199,16 @@ def main():
     # 描画: 指定された subset ごとに3つの図を保存する
     prefixes = [save_figures(matched, subset, name, args) for subset in args.subset]
 
-    # 件数表: 境界が指定されたときだけ、重複を省いた全検出で出す
-    if args.iou_bounds is not None:
-        write_tables(matched, name, args.iou_bounds, args.score_bound,
-                     os.path.join(args.out_dir, f"{name}_count_table.csv"))
+    # 件数表: 重複を省いた全検出から、スコアの絞り込み × サイズ ごとに作る
+    blocks = build_summaries(matched, stats["raw_scores"], args.iou_thr, args.summary_score_thrs)
+    summary_path = os.path.join(args.out_dir, f"{name}_summary.csv")
+    write_summary(blocks, name, summary_path)
 
     print("\n注記: my_val.json には VisDrone の無視領域（ignored regions / others）が入っていないため、"
           "無視領域への検出も相手なし（IoU = 0）として数えている")
     for prefix in prefixes:
         print(f"保存先: {prefix}_{{scatter, hist_iou, hist_score}}.png")
+    print(f"保存先: {summary_path}")
 
 
 if __name__ == "__main__":

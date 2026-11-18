@@ -9,6 +9,9 @@
   - どの GT とも重ならない検出（IoU = 0）は相手なしとして残す
 サイズ区分は相手の GT の面積（json の area）で COCO の境界（32², 96²）を使う。
 変形後の座標の正解で IoU を測るときも、load_gt の size_gt_path で面積だけ元画像のものにできる。
+件数表（検出枠数・クラス正解/不正解・IoU 閾値での内訳・IoU の平均と中央値を、
+「全検出 / スコアで絞った版」×「all / small / medium / large」ごとに）の数え上げもここで行う
+（summary_block, build_summaries。表示と CSV 保存はメイン側）。
 
 置き場所: projects/Edge_poisson_asap/tools/score_iou_match.py
 動作確認: python projects/Edge_poisson_asap/tools/score_iou_match.py （ダミーデータで割り当てを確かめる）
@@ -33,8 +36,10 @@ SIZE_NAMES = {SIZE_SMALL: "small", SIZE_MEDIUM: "medium",
 #   match : そのうち相手の GT とクラスが一致した検出だけ
 SUBSET_ALL, SUBSET_MATCH = "all", "match"
 SUBSETS = (SUBSET_ALL, SUBSET_MATCH)
-# 件数表のサイズの区切り（None = サイズで絞らない）
+
+# 件数表のサイズの区切り（None = サイズで絞らない。相手なしの検出は all にだけ入る）
 SIZE_GROUPS = [(None, "all"), (SIZE_SMALL, "small"), (SIZE_MEDIUM, "medium"), (SIZE_LARGE, "large")]
+
 
 def _group_by_image(items, keys):
     """json の要素のリストを画像 id ごとにまとめ、各キーを numpy 配列にする"""
@@ -159,6 +164,7 @@ def match_all(gts, dets):
         "n_match": int(merged["cls_match"].sum()),               # そのうちクラス一致の数
         "max_per_img": max(len(d["score"]) for d in dets.values()),
         "min_score": float(raw_scores.min()),   # json 内の最小スコア（test_cfg.score_thr の確認用）
+        "raw_scores": raw_scores,      # 省く前の全検出のスコア（件数表の「検出枠数（重複を含む）」に使う）
     }
     return merged, stats
 
@@ -175,34 +181,60 @@ def select_subset(m, subset):
         return {k: v[m["cls_match"]] for k, v in m.items()}
     raise ValueError(f"subset は {SUBSETS} のどれかにしてください: {subset}")
 
-def band_labels(bounds):
-    """境界のリストから帯の名前を作る（例: [0.1, 0.5] -> [0.00,0.10), [0.10,0.50), [0.50,1.00]）"""
-    edges = [0.0] + list(bounds) + [1.0]
-    labels = [f"[{lo:.2f},{hi:.2f})" for lo, hi in zip(edges[:-2], edges[1:-1])]
-    labels.append(f"[{edges[-2]:.2f},{edges[-1]:.2f}]")
-    return labels
 
-
-def count_table(m, iou_bounds, score_bound, size=None):
+def summary_block(m, raw_scores, iou_thr, score_thr=None, size=None):
     """
-    スコア高/低 × IoU の帯 × クラス一致/不一致 の件数を数える。
-    m    : 重複を省いた全検出（select_subset で絞る前）。クラス一致/不一致の列が表の中にあるため
-    size : None なら全サイズ（相手なしも含む）、サイズ区分の番号ならその大きさの GT を相手に持つ検出だけ
-           （相手なしの検出はサイズが決まらないので、small/medium/large のどれにも入らない）
-    Returns: [(スコアの帯, IoU の帯, クラス, 件数), ...]（帯ごとに 一致 → 不一致 の順で2行ずつ）
+    件数表の1区切り分（スコアの絞り込み × サイズ）の行を作る（以前の score_iou_summary.py と同じ項目）。
+    m          : match_all が返す検出ごとの配列（重複を省いた後、select_subset で絞る前）
+    raw_scores : 重複を省く前の全検出のスコア（「検出枠数（重複を含む）」に使う）
+    score_thr  : None なら全検出、数値ならスコアがそれ以上の検出だけ
+    size       : None なら全サイズ、サイズ区分の番号ならその大きさの GT を相手に持つ検出だけ
+    Returns: [(項目名, 値), ...]（値が None の行は「-」と表示する）
     """
+    # 区切りに入る検出を選ぶ
+    keep = np.ones(len(m["score"]), dtype=bool)
+    if score_thr is not None:
+        keep &= m["score"] >= score_thr
     if size is not None:
-        m = {k: v[m["size"] == size] for k, v in m.items()}
-    iou_band = np.digitize(m["iou"], iou_bounds)        # 0 .. len(iou_bounds)
-    iou_names = band_labels(iou_bounds)
-    score_high = m["score"] >= score_bound
-    rows = []
-    for is_high, s_name in [(True, f"score>={score_bound:.2f}"), (False, f"score<{score_bound:.2f}")]:
-        for b, i_name in enumerate(iou_names):
-            for match, c_name in [(True, "class_match"), (False, "class_mismatch_or_noGT")]:
-                mask = (score_high == is_high) & (iou_band == b) & (m["cls_match"] == match)
-                rows.append((s_name, i_name, c_name, int(mask.sum())))
-    return rows
+        keep &= m["size"] == size
+    has_gt = (m["size"] != SIZE_NONE)[keep]      # 相手の GT がいる（IoU > 0）
+    match = m["cls_match"][keep]                 # 相手の GT とクラスが一致
+    iou = m["iou"][keep]
+    high = iou >= iou_thr                        # IoU が閾値以上（位置が合っている）
+
+    # 重複を含む検出数と相手なしの数は、サイズ（相手の GT）が決まらないので全サイズのときだけ出す
+    all_size = size is None
+    n_raw = int((raw_scores >= score_thr).sum()) if score_thr is not None else len(raw_scores)
+    match_iou = iou[match]
+    t = f"{iou_thr:g}"
+    return [
+        ("検出枠数（重複を含む）", n_raw if all_size else None),
+        ("重複を省いた検出枠数", int(keep.sum())),
+        ("クラス正解", int(match.sum())),
+        ("クラス不正解（相手あり）", int((has_gt & ~match).sum())),
+        (f"  うち IoU>={t}（位置は合うがクラス違い）", int((has_gt & ~match & high).sum())),
+        ("相手なし（IoU=0）", int((~has_gt).sum()) if all_size else None),
+        (f"IoU>={t} かつクラス正解", int((match & high).sum())),
+        (f"IoU<{t} かつクラス正解（位置ずれ）", int((match & ~high).sum())),
+        ("クラス正解の IoU 平均", float(match_iou.mean()) if len(match_iou) else None),
+        ("クラス正解の IoU 中央値", float(np.median(match_iou)) if len(match_iou) else None),
+    ]
+
+
+def build_summaries(m, raw_scores, iou_thr, score_thrs):
+    """
+    件数表の全区切り（全検出 / score>=t × all / small / medium / large）を作る（1手法分）。
+    重複の除去は全検出で行った後にスコアで絞る。残す検出は GT ごとにスコア最大のものなので、
+    先にスコアで絞ってから重複を除いても結果は同じになる。
+    Returns: [(スコアの区切り名, サイズ名, summary_block の結果), ...]
+    """
+    blocks = []
+    for score_thr in [None] + list(score_thrs):
+        s_name = "全検出" if score_thr is None else f"score>={score_thr:g}"
+        for size, size_name in SIZE_GROUPS:
+            blocks.append((s_name, size_name, summary_block(m, raw_scores, iou_thr, score_thr, size)))
+    return blocks
+
 
 if __name__ == "__main__":
     # 動作確認: GT 2個・検出 4個の画像1枚で割り当てのルールを確かめる
@@ -224,13 +256,18 @@ if __name__ == "__main__":
     assert m["cls_match"].tolist() == [True, False, False]
     # クラス一致だけを選ぶと1個になる
     assert len(select_subset(m, SUBSET_MATCH)["score"]) == 1
-    # サイズ別: small は一致の1件だけ、large は不一致の1件だけ、相手なしはどちらにも入らない
-    assert sum(r[3] for r in count_table(m, [0.5], 0.5, SIZE_SMALL)) == 1
-    assert sum(r[3] for r in count_table(m, [0.5], 0.5, SIZE_LARGE)) == 1
+    # 件数表: 全検出・全サイズでは 重複を含む4 / 省いた後3 / 正解1 / 不正解1（うち IoU>=0.5 が1）/ 相手なし1
+    rows = dict(summary_block(m, det["score"], 0.5))
+    print("件数表（全検出・all）:", rows)
+    assert rows["検出枠数（重複を含む）"] == 4 and rows["重複を省いた検出枠数"] == 3
+    assert rows["クラス正解"] == 1 and rows["クラス不正解（相手あり）"] == 1
+    assert rows["  うち IoU>=0.5（位置は合うがクラス違い）"] == 1 and rows["相手なし（IoU=0）"] == 1
+    # small だけにすると正解の1件だけになり、相手なしは数えない（-）
+    rows_s = dict(summary_block(m, det["score"], 0.5, size=SIZE_SMALL))
+    assert rows_s["重複を省いた検出枠数"] == 1 and rows_s["相手なし（IoU=0）"] is None
+    # score>=0.5 で絞ると、重複を含む数は 0.9, 0.5, 0.7 の3個、省いた後は 0.9, 0.7 の2個
+    rows_h = dict(summary_block(m, det["score"], 0.5, score_thr=0.5))
+    assert rows_h["検出枠数（重複を含む）"] == 3 and rows_h["重複を省いた検出枠数"] == 2
+    # 区切りの数: (全検出 + 閾値1つ) × 4サイズ = 8
+    assert len(build_summaries(m, det["score"], 0.5, [0.3])) == 8
     print("OK")
-
-    # 件数表: 境界 IoU 0.5・スコア 0.5 で、高スコア・IoU>=0.5・一致が1件、高スコア・IoU>=0.5・不一致が1件
-    rows = count_table(m, [0.5], 0.5)
-    print("件数表:", rows)
-    assert rows[2][3] == 1 and rows[3][3] == 1
-    assert sum(r[3] for r in rows) == len(m["score"])   # 全検出がどこかの帯に入る

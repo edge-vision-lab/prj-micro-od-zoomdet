@@ -11,7 +11,7 @@
 置き場所: projects/Edge_poisson_asap/tools/compare_score_iou.py
 使い方（workspace/ で実行）:
   python projects/Edge_poisson_asap/tools/compare_score_iou.py \
-      --preds work_dirs/eval_visdrone_uniform/results.bbox.json \
+      --preds work_dirs/eval_visdrone_uniform_e50/results.bbox.json \
               work_dirs/eval_visdrone_poisson_asap_e50/results.bbox.json \
       --names uniform poisson_asap \
       --gt data_ann/VisDrone/my_val.json \
