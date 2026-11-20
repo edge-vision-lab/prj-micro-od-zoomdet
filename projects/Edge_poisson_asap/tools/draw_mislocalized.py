@@ -1,7 +1,7 @@
 """位置ずれの検出（クラスは正しいが IoU が低い検出）を、その場で推論して画像に描く。
 
 流れ（draw_detection.py と同じく、検出結果の json は使わない）:
-  1. 変形後の画像（{warp-dir}/images/）を検出器に通す
+  1. 変形後の画像（{warp-dir}/images/）を検出器に通す（画像はパスで渡す。tools/test.py と同じ読み込み処理）
   2. 検出を、保存済みの逆写像（{warp-dir}/meshes/*.npz の map_x, map_y）で元の座標へ戻す
   3. mislocalized_cases.collect_cases で「クラスは正しいが元の座標での IoU が低い」検出を集める
      （正解への割り当てをどちらの座標で行うかは --match-space で選ぶ）
@@ -9,6 +9,7 @@
   5. 1件ごとに4枚のパネルを作り、横に並べた図と一緒に保存する
   2 で元の座標へ戻すときのボックスの作り方は --bbox-mode, --bbox-n-per-side で指定する
   （省略すると --warp-dir の settings.json に残っている、正解を作ったときの方式）
+  1〜2 の推論と逆写像の読み込みは deformed_predict.py（ほかのツールと共通）
 
 対象にする検出の条件（すべて AND）:
   元の座標の IoU    : --iou-min <= IoU < --iou-max            （既定 0.0 <= IoU < 0.5）
@@ -68,12 +69,13 @@ import sys
 
 import cv2
 import numpy as np
-from mmdet.apis import inference_detector, init_detector
 
-from edge_poisson_asap.box_method import add_box_args, resolve_box_method
-from edge_poisson_asap.box_transform import inverse_bbox, select_targets
+from deformed_predict import label_to_cat_from_model, load_model, print_settings, run_detection
+from edge_poisson_asap.box_method import add_box_args
+from edge_poisson_asap.box_transform import select_targets
+from eval_common import load_json
 from mislocalized_cases import (MATCH_SPACES, collect_cases, def_bin_index, def_bin_labels,
-                                filter_orig_range, load_json, summary_lines)
+                                filter_orig_range, summary_lines)
 
 GT_COLOR = (0, 255, 0)    # 正解の枠の色（BGR で緑）
 DET_COLOR = (0, 0, 255)   # 検出の枠の色（BGR で赤）
@@ -82,61 +84,23 @@ GAP = 6                   # パネルどうしの隙間 [px]
 
 
 # ===========================================================================
-# 推論と元の座標への変換
+# 推論する画像の選び方（推論そのものは deformed_predict.run_detection）
 # ===========================================================================
-def load_inverse_map(warp_dir, stem):
-    """make_deformed_dataset.py --save-mesh で保存した逆写像 (map_x, map_y) を読む。
-    npz がなければ None。npz はあるが逆写像が入っていなければ、作り直しが必要なので止める"""
-    path = os.path.join(warp_dir, "meshes", stem + ".npz")
-    if not os.path.isfile(path):
-        return None
-    with np.load(path) as z:
-        if "map_x" not in z.files:
-            raise KeyError(f"{path} に map_x がありません（中身: {z.files}）。"
-                           "逆写像を保存する版の make_deformed_dataset.py --save-mesh でデータを作り直してください")
-        return z["map_x"], z["map_y"]
-
-
-def detect(model, img, score_thr, label_to_cat):
-    """変形後の画像（BGR）で推論し、score_thr 以上の検出を返す。
-    （draw_detection.detect と同じ処理に、スコアも返すようにしたもの）
-    Returns: ボックス (K, 4) [x, y, w, h]（変形後の座標）, スコア (K,), カテゴリ id (K,)"""
-    inst = inference_detector(model, img).pred_instances   # 配列を渡すと読み込み処理が配列用になる
-    keep = inst.scores >= score_thr
-    xyxy = inst.bboxes[keep].cpu().numpy()
-    xywh = np.c_[xyxy[:, :2], xyxy[:, 2:] - xyxy[:, :2]]   # x1y1x2y2 -> COCO の xywh
-    cats = [label_to_cat[int(l)] for l in inst.labels[keep].cpu().numpy()]
-    return xywh, inst.scores[keep].cpu().numpy(), cats
-
-
-def to_det_dicts(image_id, boxes, scores, cats):
-    """検出を COCO の結果形式（results.bbox.json と同じ形）の dict のリストにする"""
-    return [dict(image_id=image_id, category_id=int(c), bbox=[float(v) for v in b], score=float(s))
-            for b, s, c in zip(boxes, scores, cats)]
-
-
-def run_detection(model, targets, warped_images, warp_dir, score_thr, label_to_cat, box_mode, n_per_side):
-    """対象の画像ごとに、変形後の画像で推論し、逆写像で元の座標へ戻す。
-    box_mode, n_per_side: 元の座標へ戻すときのボックスの作り方（resolve_box_method で決めたもの）
-    Returns: (元の座標の検出, 変形後の座標の検出, スキップした画像の名前のリスト)
-    検出の2つは results.bbox.json と同じ形で、同じ並び
-    （同じ並びにしておくと、collect_cases の中で2つが1対1に対応付けられる）"""
-    det_orig, det_def, skipped = [], [], []
-    for n, (_, o) in enumerate(targets, 1):
-        w = warped_images.get(o["id"])
-        maps = load_inverse_map(warp_dir, os.path.splitext(w["file_name"])[0]) if w else None
-        if maps is None:
-            print(f"[スキップ] 変形後のデータか逆写像の npz がありません: {o['file_name']}")
-            skipped.append(o["file_name"])             # 集計に枚数を書くために記録する
+def select_warped_images(targets, warped_images):
+    """対象の元画像ごとに、推論する変形後の画像の情報を選ぶ。
+    変形後のデータにない画像は飛ばし、元画像の名前を記録する（集計に枚数と名前を書くため）
+    Returns: (変形後の画像の情報のリスト, 飛ばした元画像の名前のリスト,
+              変形後の画像の名前 -> 元画像の名前 の辞書)"""
+    images, skipped, to_orig_name = [], [], {}
+    for _, o in targets:
+        w = warped_images.get(o["id"])                 # make_deformed_dataset.py は画像 id を変えない
+        if w is None:
+            print(f"[スキップ] 変形後のデータにない画像です: {o['file_name']}")
+            skipped.append(o["file_name"])
             continue
-        img_d = read_image(os.path.join(warp_dir, "images", w["file_name"]))
-        boxes, scores, cats = detect(model, img_d, score_thr, label_to_cat)
-        det_def += to_det_dicts(w["id"], boxes, scores, cats)
-        # 逆変換の方式は引数（省略時は settings.json）で決めたもの
-        det_orig += to_det_dicts(o["id"], inverse_bbox(boxes, *maps, box_mode, n_per_side), scores, cats)
-        if n % 50 == 0 or n == len(targets):
-            print(f"推論 {n}/{len(targets)} 枚")
-    return det_orig, det_def, skipped
+        images.append(w)
+        to_orig_name[w["file_name"]] = o["file_name"]
+    return images, skipped, to_orig_name
 
 
 # ===========================================================================
@@ -382,17 +346,6 @@ def write_csv(selected, path):
             writer.writerow({k: c[k] for k in fields})
 
 
-def print_settings(warp_dir, box_mode=None, n_per_side=None):
-    """変形後のデータの作成時の設定（settings.json）を表示し、逆変換の方式を決めて返す。
-    box_mode, n_per_side: 引数で指定された方式（None なら settings.json の値を使う）
-    Returns: (box_mode, n_per_side)  実際に使う方式"""
-    path = os.path.join(warp_dir, "settings.json")
-    if os.path.isfile(path):
-        print(f"変形後のデータの作成時の設定: {load_json(path)}")
-    # 指定 > settings.json > 既定値 の順で決め、正解を作ったときと違えば警告する
-    return resolve_box_method(warp_dir, box_mode, n_per_side)
-
-
 # ===========================================================================
 # 引数と全体の流れ
 # ===========================================================================
@@ -470,11 +423,14 @@ def main():
         raise FileNotFoundError(f"確認できる画像がありません: {args.orig_img}")
 
     # 検出器を作り、クラス番号 -> 正解 json のカテゴリ id の対応を作る（draw_detection.py と同じ）
-    model = init_detector(args.config, args.checkpoint, device=args.device)
-    name_to_cat = {c["name"]: c["id"] for c in gt_o["categories"]}
-    label_to_cat = [name_to_cat[n] for n in model.dataset_meta["classes"]]
-    det_orig, det_def, skipped = run_detection(model, targets, warped_images, args.warp_dir,
-                                               args.score_thr, label_to_cat, box_mode, n_per_side)
+    model = load_model(args.config, args.checkpoint, device=args.device)   # score_thr は設定のまま
+    label_to_cat = label_to_cat_from_model(model, gt_o["categories"])
+    # 変形後の画像で推論し、逆写像で元の座標へ戻す（逆写像の npz がない画像は飛ばす）
+    images, skipped, to_orig_name = select_warped_images(targets, warped_images)
+    det_orig, det_def, skipped_mesh = run_detection(model, images, args.warp_dir, label_to_cat,
+                                                    (box_mode, n_per_side), args.score_thr,
+                                                    skip_missing=True)
+    skipped += [to_orig_name[name] for name in skipped_mesh]   # 集計には元画像の名前で書く
 
     # クラスは正しく正解に割り当てられた検出をすべて集め（集計の割合の分母）、
     # そのうち元の座標の IoU が対象の範囲のもの（位置ずれ）に絞る。

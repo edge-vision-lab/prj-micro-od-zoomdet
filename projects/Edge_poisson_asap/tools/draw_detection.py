@@ -1,6 +1,8 @@
 """元画像・非一様縮小後の画像に、正解と検出結果を描いて確認する。
 
 box_transform.py の main（正解を描く確認）に、検出結果の描画を足したもの。
+推論・逆写像の読み込み・設定の表示は deformed_predict.py、正解を画像ごとにまとめるのは eval_common.py
+（ほかのツールと共通）。
 --warp-dir の有無で、2つのモードを切り替える。
 
 ■ 非一様縮小（--warp-dir を指定）
@@ -46,14 +48,14 @@ box_transform.py の main（正解を描く確認）に、検出結果の描画�
 import argparse
 import json
 import os
-from collections import defaultdict
 
 import cv2
 import numpy as np
-from mmdet.apis import inference_detector, init_detector
 
-from edge_poisson_asap.box_method import add_box_args, resolve_box_method
+from deformed_predict import detect, label_to_cat_from_model, load_inverse_map, load_model, print_settings
+from edge_poisson_asap.box_method import add_box_args
 from edge_poisson_asap.box_transform import SINGLE_COLOR, draw_gt, inverse_bbox, select_targets
+from eval_common import group_by_image
 
 DET_COLOR = (0, 0, 255)   # 検出の枠の色（BGR で赤）。正解（SINGLE_COLOR = 緑）と見分けるため
 TITLE_H = 32              # 一覧画像で各図の上に付けるタイトル欄の高さ [px]
@@ -62,41 +64,11 @@ REF_SIZE = 800            # 一様縮小のとき、線の太さを決める基�
 
 
 # ===========================================================================
-# 読み込みと推論
+# 描画用の形への変換
 # ===========================================================================
 def to_anns(bboxes, category_ids):
     """ボックス (K, 4) とカテゴリ id を、draw_gt が受け取る COCO 形式の dict のリストにする"""
     return [{"bbox": list(map(float, b)), "category_id": int(c)} for b, c in zip(bboxes, category_ids)]
-
-
-def load_inverse_map(warp_dir, stem):
-    """make_deformed_dataset.py --save-mesh で保存した逆写像 (map_x, map_y) を読む。なければ None"""
-    path = os.path.join(warp_dir, "meshes", stem + ".npz")
-    if not os.path.isfile(path):
-        return None
-    with np.load(path) as z:
-        return z["map_x"], z["map_y"]
-
-
-def detect(model, img, score_thr, label_to_cat):
-    """画像（BGR）で推論し、score_thr 以上の検出を返す。
-    非一様縮小では変形後の画像を渡すので、変形後の座標で返る。
-    一様縮小では元画像を渡すので、mmdet が元画像の座標に戻して返す。
-    Returns: ボックス (K, 4) [x, y, w, h], カテゴリ id (K,)"""
-    inst = inference_detector(model, img).pred_instances   # 配列を渡すと読み込み処理が配列用になる
-    keep = inst.scores >= score_thr                         # スコアが下限以上の検出
-    xyxy = inst.bboxes[keep].cpu().numpy()
-    xywh = np.c_[xyxy[:, :2], xyxy[:, 2:] - xyxy[:, :2]]   # x1y1x2y2 -> COCO の xywh
-    cats = [label_to_cat[int(l)] for l in inst.labels[keep].cpu().numpy()]
-    return xywh, cats
-
-
-def group_by_image(anns):
-    """正解を画像 id ごとのリストにまとめる"""
-    out = defaultdict(list)
-    for a in anns:
-        out[a["image_id"]].append(a)
-    return out
 
 
 # ===========================================================================
@@ -192,9 +164,11 @@ def process_warped(orig_path, o, ctx):
     if orig_img is None or warped_img is None:
         return "画像を読めません"
 
-    # 検出: 変形後の画像で推論し、保存済みの逆写像で元の座標へ戻す
-    det_boxes, det_cats = detect(ctx["model"], warped_img, args.score_thr, ctx["label_to_cat"])
-    orig_dets = to_anns(inverse_bbox(det_boxes, *maps, ctx["box_mode"], ctx["n_per_side"]), det_cats)
+    # 検出: 変形後の画像（読み込んだ配列）で推論し、保存済みの逆写像で元の座標へ戻す（スコアは描画に使わない）
+    det_boxes, _, det_cats = detect(ctx["model"], warped_img, ctx["label_to_cat"], args.score_thr)
+    orig_boxes = (inverse_bbox(det_boxes, *maps, ctx["box_mode"], ctx["n_per_side"])
+                  if len(det_boxes) else det_boxes)       # 検出が0個のときは戻す処理を呼ばない
+    orig_dets = to_anns(orig_boxes, det_cats)
 
     # 正解（元の正解と作成済みの変形後の正解）と検出を描き、4枚と一覧を保存する
     name = os.path.splitext(o["file_name"])[0]
@@ -214,7 +188,7 @@ def process_uniform(orig_path, o, ctx):
     orig_img = cv2.imread(orig_path)
     if orig_img is None:
         return "画像を読めません"
-    det_boxes, det_cats = detect(ctx["model"], orig_img, args.score_thr, ctx["label_to_cat"])
+    det_boxes, _, det_cats = detect(ctx["model"], orig_img, ctx["label_to_cat"], args.score_thr)
     name = os.path.splitext(o["file_name"])[0]
     save_check_uniform(args.out_dir, name, orig_img, ctx["orig_anns"][o["id"]],
                        to_anns(det_boxes, det_cats),
@@ -253,14 +227,10 @@ def prepare_warped(args, ctx):
     """非一様縮小のモードで必要なもの（変形後の正解・画像情報・ボックスの作り方）を ctx に入れる"""
     with open(os.path.join(args.warp_dir, "annotations.json")) as f:
         warped = json.load(f)
-    # 作成時の設定を表示しておく（どの条件のデータで確認したかを残すため）
-    settings_path = os.path.join(args.warp_dir, "settings.json")
-    if os.path.isfile(settings_path):
-        with open(settings_path) as f:
-            print(f"変形後のデータの作成時の設定: {json.load(f)}")
+    # 作成時の設定を表示し（どの条件のデータで確認したかを残すため）、
     # 検出を元の座標へ戻す方式を決める（指定 > settings.json > 既定値）
-    ctx["box_mode"], ctx["n_per_side"] = resolve_box_method(args.warp_dir, args.bbox_mode,
-                                                            args.bbox_n_per_side)
+    ctx["box_mode"], ctx["n_per_side"] = print_settings(args.warp_dir, args.bbox_mode,
+                                                        args.bbox_n_per_side)
     ctx["warped_anns"] = group_by_image(warped["annotations"])   # 画像 id は元のデータと同じ
     ctx["warped_images"] = {im["id"]: im for im in warped["images"]}
 
@@ -272,12 +242,11 @@ def main():
     with open(args.orig_ann) as f:
         orig = json.load(f)
 
-    model = init_detector(args.config, args.checkpoint, device=args.device)
-    # 検出器のクラス番号 -> 正解 json のカテゴリ id（クラス名で対応させる）
-    name_to_cat = {c["name"]: c["id"] for c in orig["categories"]}
+    model = load_model(args.config, args.checkpoint, device=args.device)   # score_thr は設定のまま
     ctx = {   # 1枚分の処理で共通に使うもの
         "args": args, "model": model,
-        "label_to_cat": [name_to_cat[n] for n in model.dataset_meta["classes"]],
+        # 検出器のクラス番号 -> 正解 json のカテゴリ id（クラス名で対応させる）
+        "label_to_cat": label_to_cat_from_model(model, orig["categories"]),
         "orig_anns": group_by_image(orig["annotations"]),
         "gt_color": SINGLE_COLOR if args.color_mode == "single" else None,
         "det_color": DET_COLOR if args.color_mode == "single" else None,

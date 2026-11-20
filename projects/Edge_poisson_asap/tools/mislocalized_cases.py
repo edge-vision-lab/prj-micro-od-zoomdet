@@ -17,13 +17,20 @@
 集計（summary_lines）:
   クラス正解で割り当てられた検出（分母）のうち、元の座標の IoU が対象範囲のものを、
   変形後の座標の IoU の区間（例: >=0.75 / 0.50-0.75 / <0.50 / 不明）ごとに、サイズ別・クラス別に数える
+
+json の読み込み・サイズ区分・IoU 行列・画像ごとのまとめ・表示幅は eval_common.py（ほかのツールと共通）。
+以前この中にあった名前（load_json, size_label, iou_matrix, index_by_image, text_width）は、
+ほかのコードから読み込めるよう、ここでも同じ名前で使えるようにしてある。
 """
-import json
 import os
-import unicodedata
 from collections import defaultdict
 
 import numpy as np
+
+from eval_common import group_by_image, iou_matrix, load_json, size_label, text_width  # noqa: F401
+
+# 以前の名前（画像ごとにまとめる関数）。中身は eval_common.group_by_image と同じ
+index_by_image = group_by_image
 
 # 割り当てに使える座標の種類
 MATCH_SPACES = ("orig", "deformed")
@@ -31,51 +38,11 @@ MATCH_SPACES = ("orig", "deformed")
 SIZES = ("all", "small", "medium", "large")
 
 
-def load_json(path):
-    """json ファイルを読み込んで返す"""
-    with open(path) as f:
-        return json.load(f)
-
-
-def size_label(area):
-    """元画像での面積から COCO のサイズ区分を返す（境界は 32², 96²）"""
-    if area < 32 ** 2:
-        return 'small'
-    if area < 96 ** 2:
-        return 'medium'
-    return 'large'
-
-
-def iou_matrix(dets_xywh, gts_xywh):
-    """検出 (N,4) と正解 (M,4) の IoU 行列 (N,M) を返す。ボックスは COCO 形式 [x, y, w, h]"""
-    d = np.asarray(dets_xywh, dtype=np.float64).reshape(-1, 4)
-    g = np.asarray(gts_xywh, dtype=np.float64).reshape(-1, 4)
-    # 左上・右下の座標に直す（検出は列ベクトル、正解は行ベクトルにして総当たりで計算）
-    dx1, dy1 = d[:, 0:1], d[:, 1:2]
-    dx2, dy2 = dx1 + d[:, 2:3], dy1 + d[:, 3:4]
-    gx1, gy1 = g[:, 0], g[:, 1]
-    gx2, gy2 = gx1 + g[:, 2], gy1 + g[:, 3]
-    # 重なり部分の幅と高さ（重ならなければ 0）
-    iw = np.clip(np.minimum(dx2, gx2) - np.maximum(dx1, gx1), 0, None)
-    ih = np.clip(np.minimum(dy2, gy2) - np.maximum(dy1, gy1), 0, None)
-    inter = iw * ih
-    union = d[:, 2:3] * d[:, 3:4] + g[:, 2] * g[:, 3] - inter
-    return np.where(union > 0, inter / np.maximum(union, 1e-12), 0.0)
-
-
 def pair_iou(det, gt):
     """検出1つと正解1つの IoU。どちらかがなければ NaN（不明）を返す"""
     if det is None or gt is None:
         return float('nan')
     return float(iou_matrix([det['bbox']], [gt['bbox']])[0, 0])
-
-
-def index_by_image(items):
-    """検出や正解を image_id ごとのリストにまとめる"""
-    out = defaultdict(list)
-    for it in items:
-        out[it['image_id']].append(it)
-    return out
 
 
 def map_image_ids(gt_orig, gt_def):
@@ -223,11 +190,6 @@ def def_bin_index(v, edges):
     if np.isnan(v):
         return n
     return n - 1 - int(np.searchsorted(edges, v, side='right'))
-
-
-def text_width(s):
-    """表示したときの幅（全角文字は 2、半角文字は 1 として数える）"""
-    return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in str(s))
 
 
 def format_table(header, rows):

@@ -13,9 +13,11 @@ import math
 
 import numpy as np
 
-# COCO 基準のサイズ区分の境界（元座標の面積、単位は画素^2）
-COCO_SMALL_MAX = 32 ** 2   # これ未満を small
-COCO_MEDIUM_MAX = 96 ** 2  # これ未満を medium、以上を large
+from eval_common import MEDIUM_MAX_AREA, SMALL_MAX_AREA, size_label
+
+# COCO 基準のサイズ区分の境界（元座標の面積、単位は画素^2）。値は eval_common.py と共通
+COCO_SMALL_MAX = SMALL_MAX_AREA    # これ未満を small
+COCO_MEDIUM_MAX = MEDIUM_MAX_AREA  # これ未満を medium、以上を large
 SIZE_NAMES = ('small', 'medium', 'large')
 
 # 統計を取る対象の指標名
@@ -41,12 +43,9 @@ def load_coco_like(path):
 
 
 def coco_size_category(area):
-    """元座標の面積から COCO 基準のサイズ区分名（small/medium/large）を返す。"""
-    if area < COCO_SMALL_MAX:
-        return 'small'
-    if area < COCO_MEDIUM_MAX:
-        return 'medium'
-    return 'large'
+    """元座標の面積から COCO 基準のサイズ区分名（small/medium/large）を返す。
+    （中身は eval_common.size_label。ほかのツールとサイズ区分の決め方をそろえるため）"""
+    return size_label(area)
 
 
 def uniform_scale(orig_size, warp_size, baseline, frame):

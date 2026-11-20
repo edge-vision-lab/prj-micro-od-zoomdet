@@ -13,6 +13,9 @@
 「全検出 / スコアで絞った版」×「all / small / medium / large」ごとに）の数え上げもここで行う
 （summary_block, build_summaries。表示と CSV 保存はメイン側）。
 
+サイズの境界・サイズ区分の番号・IoU 行列・面積の置き換えは eval_common.py（ほかのツールと共通）。
+以前この中にあった名前（SIZE_SMALL など, iou_matrix, size_category）は、ここでも同じ名前で使える。
+
 置き場所: projects/Edge_poisson_asap/tools/score_iou_match.py
 動作確認: python projects/Edge_poisson_asap/tools/score_iou_match.py （ダミーデータで割り当てを確かめる）
 """
@@ -22,12 +25,10 @@ from collections import defaultdict
 
 import numpy as np
 
-# COCO の物体サイズの境界（元画像での面積 [ピクセル数]）
-SMALL_MAX_AREA = 32 ** 2
-MEDIUM_MAX_AREA = 96 ** 2
+from eval_common import (MEDIUM_MAX_AREA, SIZE_LARGE, SIZE_MEDIUM, SIZE_NONE,  # noqa: F401
+                         SIZE_SMALL, SMALL_MAX_AREA, iou_matrix, replace_area_by_id, size_category)
 
-# サイズ区分の番号（相手の GT がいない検出は SIZE_NONE）
-SIZE_NONE, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE = -1, 0, 1, 2
+# サイズ区分の番号 → 表示名
 SIZE_NAMES = {SIZE_SMALL: "small", SIZE_MEDIUM: "medium",
               SIZE_LARGE: "large", SIZE_NONE: "no GT"}
 
@@ -68,14 +69,8 @@ def load_gt(gt_path, size_gt_path=None):
     with open(gt_path) as f:
         anns = json.load(f)["annotations"]
     if size_gt_path is not None and os.path.abspath(size_gt_path) != os.path.abspath(gt_path):
-        with open(size_gt_path) as f:
-            area_by_id = {a["id"]: a["area"] for a in json.load(f)["annotations"]}
-        missing = [a["id"] for a in anns if a["id"] not in area_by_id]
-        if missing:
-            raise KeyError(f"{size_gt_path} にないアノテーション id が {len(missing)} 個あります"
-                           f"（例: {missing[:5]}）")
         # 面積だけ元画像のものに置き換える（箱は gt_path の座標のまま）
-        anns = [{**a, "area": area_by_id[a["id"]]} for a in anns]
+        anns = replace_area_by_id(anns, size_gt_path)
     return _group_by_image(anns, ["bbox", "category_id", "area"])
 
 
@@ -86,29 +81,6 @@ def load_dets(pred_path):
     if len(dets) == 0:
         raise ValueError(f"{pred_path} に検出が1つもありません")
     return _group_by_image(dets, ["bbox", "category_id", "score"])
-
-
-def iou_matrix(a, b):
-    """
-    [x, y, w, h] 形式の箱どうしの IoU を全組み合わせで求める（クラスは見ない）
-    a: (N, 4), b: (M, 4)  ->  (N, M)
-    """
-    ax1, ay1 = a[:, 0:1], a[:, 1:2]
-    ax2, ay2 = ax1 + a[:, 2:3], ay1 + a[:, 3:4]
-    bx1, by1 = b[:, 0], b[:, 1]
-    bx2, by2 = bx1 + b[:, 2], by1 + b[:, 3]
-    # 重なり部分の幅と高さ（重ならなければ 0）
-    iw = np.clip(np.minimum(ax2, bx2) - np.maximum(ax1, bx1), 0, None)
-    ih = np.clip(np.minimum(ay2, by2) - np.maximum(ay1, by1), 0, None)
-    inter = iw * ih
-    union = a[:, 2:3] * a[:, 3:4] + b[:, 2] * b[:, 3] - inter
-    return np.where(union > 0, inter / np.maximum(union, 1e-12), 0.0)
-
-
-def size_category(areas):
-    """面積から COCO のサイズ区分の番号を返す"""
-    return np.where(areas < SMALL_MAX_AREA, SIZE_SMALL,
-                    np.where(areas < MEDIUM_MAX_AREA, SIZE_MEDIUM, SIZE_LARGE))
 
 
 def match_image(det, gt):
